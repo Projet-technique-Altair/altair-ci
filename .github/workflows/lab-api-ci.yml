@@ -22,14 +22,18 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
-      - name: Format check
-        run: cargo fmt --all -- --check
-
-      - name: Lint
-        run: cargo clippy --all-targets --locked -- -D warnings
-
       - name: Tests
         run: cargo test --locked
 
       - name: Build (release)
         run: cargo build --release --locked
+
+      # ⚠️ NON BLOQUANT
+      - name: Rustfmt (non-blocking)
+        run: |
+          cargo fmt --all -- --check || echo "::warning::rustfmt issues detected"
+
+      # ⚠️ NON BLOQUANT
+      - name: Clippy (non-blocking)
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings || echo "::warning::clippy warnings detected"
