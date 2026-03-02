@@ -1,0 +1,67 @@
+name: Groups MS CI
+
+on:
+  workflow_call:
+    inputs:
+      rust_toolchain:
+        type: string
+        required: false
+        default: stable
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: altair
+          POSTGRES_PASSWORD: altair
+          POSTGRES_DB: altair_groups_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U altair -d altair_groups_db"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      DATABASE_URL: postgres://altair:altair@localhost:5432/altair_groups_db
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ inputs.rust_toolchain }}
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features postgres
+
+      - name: Apply migrations
+        run: sqlx migrate run
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Rustfmt (non-blocking)
+        run: |
+          cargo fmt --all -- --check || echo "::warning::rustfmt issues detected"
+
+      - name: Clippy (non-blocking)
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings || echo "::warning::clippy warnings detected"
