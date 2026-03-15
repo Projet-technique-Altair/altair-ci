@@ -1,0 +1,106 @@
+name: Lab Templates CI
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tooling
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Discover template directories
+        id: discover
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t templates < <(
+            find . -mindepth 2 -maxdepth 2 -type f -name metadata.json -printf '%h\n' \
+              | while read -r dir; do
+                  if [ -f "$dir/Dockerfile" ]; then
+                    printf '%s\n' "$dir"
+                  fi
+                done \
+              | sort -u
+          )
+
+          if [ "${#templates[@]}" -eq 0 ]; then
+            echo "No template directories found"
+            exit 1
+          fi
+
+          {
+            echo "templates<<EOF"
+            printf '%s\n' "${templates[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate metadata shape
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r template_dir; do
+            [ -n "$template_dir" ] || continue
+            metadata_file="$template_dir/metadata.json"
+
+            echo "Validating $metadata_file"
+
+            jq -e '
+              .lab_id and
+              .name and
+              .lab_type and
+              .difficulty and
+              .category and
+              .estimated_duration and
+              .story and
+              .objectives and
+              .template_path and
+              (.steps | type == "array" and length > 0) and
+              (
+                .steps
+                | all(
+                    .step_number and
+                    .title and
+                    .description and
+                    .question and
+                    .expected_answer and
+                    .validation_type and
+                    (.points | type == "number") and
+                    (
+                      .hints == null or
+                      (
+                        .hints | type == "array" and
+                        all(
+                          .hint_number and
+                          (.cost | type == "number") and
+                          .text
+                        )
+                      )
+                    )
+                  )
+              )
+            ' "$metadata_file" >/dev/null
+          done <<< "${{ steps.discover.outputs.templates }}"
+
+      - name: Build template images
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r template_dir; do
+            [ -n "$template_dir" ] || continue
+            image_name="ci-$(basename "$template_dir"):${GITHUB_SHA}"
+
+            echo "Building $template_dir as $image_name"
+            docker build -t "$image_name" "$template_dir"
+          done <<< "${{ steps.discover.outputs.templates }}"
