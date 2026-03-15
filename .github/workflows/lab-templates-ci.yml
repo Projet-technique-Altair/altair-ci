@@ -56,39 +56,68 @@ jobs:
             echo "Validating $metadata_file"
 
             jq -e '
+              def valid_family:
+                . == "course" or . == "guided" or . == "non_guided";
+
+              def valid_delivery:
+                . == "terminal" or . == "web" or . == "complex";
+
+              def valid_runtime:
+                (.app_port == null or (.app_port | type == "number")) and
+                (.services | type == "array") and
+                (.entrypoints | type == "array");
+
+              def valid_step:
+                .step_number and
+                .title and
+                .description and
+                (.question == null or (.question | type == "string")) and
+                (.expected_answer == null or (.expected_answer | type == "string")) and
+                (.validation_type == null or (.validation_type | type == "string")) and
+                (.points | type == "number") and
+                (
+                  .hints == null or
+                  (
+                    .hints | type == "array" and
+                    all(
+                      .hint_number and
+                      (.cost | type == "number") and
+                      .text
+                    )
+                  )
+                );
+
+              def expected_legacy_lab_type:
+                if .lab_family == "guided" and .lab_delivery == "terminal" then "ctf_terminal_guided"
+                elif .lab_family == "guided" and .lab_delivery == "web" then "ctf_web_guided"
+                elif .lab_family == "non_guided" and .lab_delivery == "terminal" then "ctf_terminal_non_guided"
+                elif .lab_family == "non_guided" and .lab_delivery == "web" then "ctf_web_non_guided"
+                else null
+                end;
+
               .lab_id and
               .name and
-              .lab_type and
+              (.lab_family | valid_family) and
+              (.lab_delivery | valid_delivery) and
+              (.runtime | type == "object") and
+              (.runtime | valid_runtime) and
               .difficulty and
               .category and
               .estimated_duration and
               .story and
               .objectives and
+              (.prerequisites == null or (.prerequisites | type == "string")) and
               .template_path and
-              (.steps | type == "array" and length > 0) and
               (
-                .steps
-                | all(
-                    .step_number and
-                    .title and
-                    .description and
-                    .question and
-                    .expected_answer and
-                    .validation_type and
-                    (.points | type == "number") and
-                    (
-                      .hints == null or
-                      (
-                        .hints | type == "array" and
-                        all(
-                          .hint_number and
-                          (.cost | type == "number") and
-                          .text
-                        )
-                      )
-                    )
-                  )
-              )
+                (.lab_type | not) or
+                (.lab_type | type == "string")
+              ) and
+              (
+                (expected_legacy_lab_type == null) or
+                (.lab_type == expected_legacy_lab_type)
+              ) and
+              (.steps | type == "array" and length > 0) and
+              (.steps | all(valid_step))
             ' "$metadata_file" >/dev/null
           done <<< "${{ steps.discover.outputs.templates }}"
 
