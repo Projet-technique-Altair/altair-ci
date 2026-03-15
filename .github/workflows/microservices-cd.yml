@@ -1,0 +1,217 @@
+name: Microservices CD
+
+# Reusable workflow.
+# This file is not triggered directly by push/pull_request.
+# A wrapper workflow in a microservice repository must call it with `uses:`.
+
+on:
+  workflow_call:
+    # Inputs are the configuration surface exposed to each caller repository.
+    # Each repo passes its own service name, image name, env vars, etc.
+    inputs:
+      gcp_project_id:
+        type: string
+        required: true
+      region:
+        type: string
+        required: true
+      artifact_registry_host:
+        type: string
+        required: true
+      artifact_registry_repo:
+        type: string
+        required: true
+      workload_identity_provider:
+        type: string
+        required: true
+      deploy_service_account:
+        type: string
+        required: true
+      service_name:
+        type: string
+        required: true
+      image_name:
+        type: string
+        required: true
+      workdir:
+        type: string
+        required: false
+        default: .
+      dockerfile:
+        type: string
+        required: false
+        default: Dockerfile
+      platform:
+        type: string
+        required: false
+        default: linux/amd64
+      cloud_run_service_account:
+        type: string
+        required: false
+        default: ""
+      cloud_run_env_vars:
+        type: string
+        required: false
+        default: ""
+      cloud_run_secrets:
+        type: string
+        required: false
+        default: ""
+      extra_deploy_args:
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  # Required by actions/checkout.
+  contents: read
+  # Required by google-github-actions/auth for Workload Identity Federation.
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        # Uses the GitHub OIDC token + the configured workload identity provider
+        # to impersonate the deploy service account without storing a static GCP key.
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.deploy_service_account }}
+
+      - name: Setup gcloud
+        # Installs and configures gcloud for subsequent commands.
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ inputs.gcp_project_id }}
+
+      - name: Configure Docker for Artifact Registry
+        # Lets Docker push to the Artifact Registry host passed by the caller.
+        run: gcloud auth configure-docker "${{ inputs.artifact_registry_host }}" --quiet
+
+      - name: Compute next image version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Base image path without the tag.
+          image_base="${{ inputs.artifact_registry_host }}/${{ inputs.gcp_project_id }}/${{ inputs.artifact_registry_repo }}/${{ inputs.image_name }}"
+
+          # Ask Artifact Registry for existing tags of the current image.
+          # Only keep tags of the form vN, then pick the highest numeric suffix.
+          latest_version="$(
+            gcloud artifacts docker tags list "${image_base}" \
+              --format='value(tag)' 2>/dev/null \
+            | grep -E '^v[0-9]+$' \
+            | sed 's/^v//' \
+            | sort -n \
+            | tail -n1 || true
+          )"
+
+          if [ -z "${latest_version}" ]; then
+            next_version="v1"
+          else
+            next_version="v$((latest_version + 1))"
+          fi
+
+          versioned_image_uri="${image_base}:${next_version}"
+          latest_image_uri="${image_base}:latest"
+
+          echo "IMAGE_BASE=${image_base}" >> "${GITHUB_ENV}"
+          echo "VERSION_TAG=${next_version}" >> "${GITHUB_ENV}"
+          echo "VERSIONED_IMAGE_URI=${versioned_image_uri}" >> "${GITHUB_ENV}"
+          echo "LATEST_IMAGE_URI=${latest_image_uri}" >> "${GITHUB_ENV}"
+
+          echo "version_tag=${next_version}" >> "${GITHUB_OUTPUT}"
+          echo "versioned_image_uri=${versioned_image_uri}" >> "${GITHUB_OUTPUT}"
+          echo "latest_image_uri=${latest_image_uri}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build image
+        working-directory: ${{ inputs.workdir }}
+        run: |
+          # Build context comes from the caller repo.
+          # `workdir` lets a repo build from a subdirectory if needed.
+          docker build \
+            --platform "${{ inputs.platform }}" \
+            -f "${{ inputs.dockerfile }}" \
+            -t "${VERSIONED_IMAGE_URI}" \
+            -t "${LATEST_IMAGE_URI}" \
+            .
+
+      - name: Push versioned image
+        # Pushes the immutable deployment tag, for example v7.
+        run: docker push "${VERSIONED_IMAGE_URI}"
+
+      - name: Push latest image
+        # Pushes a convenience tag pointing to the most recently built image.
+        run: docker push "${LATEST_IMAGE_URI}"
+
+      - name: Deploy to Cloud Run
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Normalize sentinel values used in GitHub variables.
+          # This avoids interactive gh issues on empty strings while still letting
+          # repositories express "no env vars" or "no secrets".
+          cloud_run_service_account="${{ inputs.cloud_run_service_account }}"
+          cloud_run_env_vars="${{ inputs.cloud_run_env_vars }}"
+          cloud_run_secrets="${{ inputs.cloud_run_secrets }}"
+          extra_deploy_args="${{ inputs.extra_deploy_args }}"
+
+          for var_name in cloud_run_service_account cloud_run_env_vars cloud_run_secrets extra_deploy_args; do
+            current_value="${!var_name}"
+            case "$current_value" in
+              ""|NONE|EMPTY)
+                printf -v "$var_name" '%s' ""
+                ;;
+            esac
+          done
+
+          # Build the deploy command incrementally so optional parameters can be added
+          # only when the caller repo actually provided them.
+          cmd=(
+            gcloud run deploy "${{ inputs.service_name }}"
+            --image "${VERSIONED_IMAGE_URI}"
+            --region "${{ inputs.region }}"
+            --project "${{ inputs.gcp_project_id }}"
+            --quiet
+          )
+
+          if [ -n "${cloud_run_service_account}" ]; then
+            # Runtime service account used by the deployed Cloud Run service.
+            cmd+=(--service-account "${cloud_run_service_account}")
+          fi
+
+          if [ -n "${cloud_run_env_vars}" ]; then
+            # Caller repo passes env vars as a single comma-separated string.
+            # Example: "DATABASE_URL=...,PORT=3002"
+            cmd+=(--set-env-vars "${cloud_run_env_vars}")
+          fi
+
+          if [ -n "${cloud_run_secrets}" ]; then
+            # Caller repo passes secret mappings in gcloud format.
+            # Example: "DATABASE_URL=db-url:latest"
+            cmd+=(--set-secrets "${cloud_run_secrets}")
+          fi
+
+          if [ -n "${extra_deploy_args}" ]; then
+            # Escape hatch for service-specific flags not worth first-classing yet.
+            # Example: "--allow-unauthenticated --memory 512Mi --cpu 1"
+            # shellcheck disable=SC2206
+            extra_args=( ${extra_deploy_args} )
+            cmd+=("${extra_args[@]}")
+          fi
+
+          "${cmd[@]}"
+
+      - name: Output deployed image
+        run: |
+          echo "Deployed image: ${VERSIONED_IMAGE_URI}"
+          echo "Convenience tag: ${LATEST_IMAGE_URI}"

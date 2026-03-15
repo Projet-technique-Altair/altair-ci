@@ -1,0 +1,99 @@
+name: Lab Templates CD
+
+# Reusable workflow dedicated to lab runtime images.
+# Unlike microservices, templates are only built and pushed.
+# They are not deployed to Cloud Run by this workflow.
+
+on:
+  workflow_call:
+    # Inputs are provided by a wrapper workflow from the templates repository.
+    inputs:
+      gcp_project_id:
+        type: string
+        required: true
+      artifact_registry_host:
+        type: string
+        required: true
+      artifact_registry_repo:
+        type: string
+        required: true
+      workload_identity_provider:
+        type: string
+        required: true
+      deploy_service_account:
+        type: string
+        required: true
+      template_dir:
+        type: string
+        required: true
+      image_name:
+        type: string
+        required: true
+      image_tag:
+        type: string
+        required: false
+        default: latest
+      platform:
+        type: string
+        required: false
+        default: linux/amd64
+
+permissions:
+  # Required by actions/checkout.
+  contents: read
+  # Required by google-github-actions/auth for Workload Identity Federation.
+  id-token: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    env:
+      # Final image URI for the lab runtime image.
+      # Here the tag is provided by the caller instead of always using github.sha.
+      IMAGE_URI: ${{ inputs.artifact_registry_host }}/${{ inputs.gcp_project_id }}/${{ inputs.artifact_registry_repo }}/${{ inputs.image_name }}:${{ inputs.image_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        # Uses GitHub OIDC to impersonate the deploy service account.
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.deploy_service_account }}
+
+      - name: Setup gcloud
+        # Installs and configures gcloud for the registry auth step.
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ inputs.gcp_project_id }}
+
+      - name: Configure Docker for Artifact Registry
+        # Lets Docker push to the templates/labs registry host.
+        run: gcloud auth configure-docker "${{ inputs.artifact_registry_host }}" --quiet
+
+      - name: Check template structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Minimal structural validation before attempting a build.
+          # These files are required for every template directory.
+          test -f "${{ inputs.template_dir }}/Dockerfile"
+          test -f "${{ inputs.template_dir }}/metadata.json"
+
+      - name: Build template image
+        run: |
+          # Build context is the template directory itself.
+          # Each template directory is expected to be independently buildable.
+          docker build \
+            --platform "${{ inputs.platform }}" \
+            -t "${IMAGE_URI}" \
+            "${{ inputs.template_dir }}"
+
+      - name: Push template image
+        # Pushes the lab image to the dedicated templates registry.
+        run: docker push "${IMAGE_URI}"
+
+      - name: Output pushed image
+        run: echo "Pushed image: ${IMAGE_URI}"
