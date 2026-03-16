@@ -192,13 +192,20 @@ jobs:
 
           if [ -n "${cloud_run_env_vars}" ]; then
             # Caller repo passes env vars as KEY=value lines.
-            # This avoids gcloud parsing issues when values themselves contain commas.
+            # Convert them to a YAML map because gcloud expects YAML/JSON for
+            # --env-vars-file, not a raw .env file.
             env_vars_file="$(mktemp)"
 
             while IFS= read -r env_line; do
               # Skip empty lines to let repos format the variable more readably.
               [ -z "${env_line}" ] && continue
-              printf '%s\n' "${env_line}" >> "${env_vars_file}"
+
+              env_key="${env_line%%=*}"
+              env_value="${env_line#*=}"
+
+              # Write a simple YAML mapping. Single quotes are doubled to stay valid YAML.
+              escaped_value="${env_value//\'/\'\'}"
+              printf "%s: '%s'\n" "${env_key}" "${escaped_value}" >> "${env_vars_file}"
             done <<< "${cloud_run_env_vars}"
 
             cmd+=(--env-vars-file "${env_vars_file}")
