@@ -164,6 +164,7 @@ jobs:
           cloud_run_env_vars="${{ inputs.cloud_run_env_vars }}"
           cloud_run_secrets="${{ inputs.cloud_run_secrets }}"
           extra_deploy_args="${{ inputs.extra_deploy_args }}"
+          env_vars_file=""
 
           for var_name in cloud_run_service_account cloud_run_env_vars cloud_run_secrets extra_deploy_args; do
             current_value="${!var_name}"
@@ -190,9 +191,17 @@ jobs:
           fi
 
           if [ -n "${cloud_run_env_vars}" ]; then
-            # Caller repo passes env vars as a single comma-separated string.
-            # Example: "DATABASE_URL=...,PORT=3002"
-            cmd+=(--set-env-vars "${cloud_run_env_vars}")
+            # Caller repo passes env vars as KEY=value lines.
+            # This avoids gcloud parsing issues when values themselves contain commas.
+            env_vars_file="$(mktemp)"
+
+            while IFS= read -r env_line; do
+              # Skip empty lines to let repos format the variable more readably.
+              [ -z "${env_line}" ] && continue
+              printf '%s\n' "${env_line}" >> "${env_vars_file}"
+            done <<< "${cloud_run_env_vars}"
+
+            cmd+=(--env-vars-file "${env_vars_file}")
           fi
 
           if [ -n "${cloud_run_secrets}" ]; then
@@ -210,6 +219,10 @@ jobs:
           fi
 
           "${cmd[@]}"
+
+          if [ -n "${env_vars_file}" ] && [ -f "${env_vars_file}" ]; then
+            rm -f "${env_vars_file}"
+          fi
 
       - name: Output deployed image
         run: |
