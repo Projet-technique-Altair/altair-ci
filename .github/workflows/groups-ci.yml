@@ -30,9 +30,6 @@ jobs:
           --health-timeout=5s
           --health-retries=10
 
-    env:
-      DATABASE_URL: postgres://altair:altair@localhost:5432/altair_groups_db
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,12 +47,16 @@ jobs:
         run: cargo install sqlx-cli --no-default-features --features postgres
 
       - name: Apply migrations
+        env:
+          DATABASE_URL: postgres://altair:altair@localhost:5432/altair_groups_db
         run: sqlx migrate run
 
       - name: Build (release)
         run: cargo build --release --locked
 
       - name: Tests
+        env:
+          DATABASE_URL: postgres://altair:altair@localhost:5432/altair_groups_db
         run: cargo test --locked
 
       - name: Rustfmt (non-blocking)
