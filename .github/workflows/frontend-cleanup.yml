@@ -1,0 +1,125 @@
+name: Frontend Cleanup
+
+# Reusable workflow dedicated to safe cleanup of stale frontend objects.
+# It keeps the latest deployment manifest no matter what, keeps every manifest
+# newer than the retention window, and deletes only objects not referenced by
+# any retained manifest.
+
+on:
+  workflow_call:
+    inputs:
+      gcp_project_id:
+        type: string
+        required: true
+      workload_identity_provider:
+        type: string
+        required: true
+      deploy_service_account:
+        type: string
+        required: true
+      frontend_bucket:
+        type: string
+        required: true
+      retention_hours:
+        type: string
+        required: false
+        default: "24"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.deploy_service_account }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ inputs.gcp_project_id }}
+
+      - name: Cleanup stale frontend objects
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # GitHub schedule uses UTC. The wrapper triggers this reusable workflow
+          # at 01:00 and 02:00 UTC, and this guard ensures the cleanup actually
+          # runs only once at 03:00 Europe/Paris, regardless of DST.
+          current_paris_time="$(TZ=Europe/Paris date +%H:%M)"
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ] && [ "${current_paris_time}" != "03:00" ]; then
+            echo "Skipping cleanup: current Europe/Paris time is ${current_paris_time}, expected 03:00."
+            exit 0
+          fi
+
+          bucket="${{ inputs.frontend_bucket }}"
+          retention_hours="${{ inputs.retention_hours }}"
+          manifest_prefix="gs://${bucket}/_deploy/manifests"
+
+          workdir="$(mktemp -d)"
+          manifests_list="${workdir}/manifests.txt"
+          keep_manifests="${workdir}/keep-manifests.txt"
+          keep_paths="${workdir}/keep-paths.txt"
+          all_objects="${workdir}/all-objects.txt"
+          delete_paths="${workdir}/delete-paths.txt"
+
+          cutoff_utc="$(date -u -d "${retention_hours} hours ago" +%Y%m%dT%H%M%SZ)"
+
+          gcloud storage ls "${manifest_prefix}/*.txt" \
+            | sed "s#${manifest_prefix}/##" \
+            | sort > "${manifests_list}"
+
+          if [ ! -s "${manifests_list}" ]; then
+            echo "No manifests found. Nothing to clean."
+            exit 0
+          fi
+
+          latest_manifest="$(tail -n 1 "${manifests_list}")"
+          printf '%s\n' "${latest_manifest}" > "${keep_manifests}"
+
+          awk -v cutoff="${cutoff_utc}" -F- '
+            {
+              ts=$1
+              if (ts >= cutoff) {
+                print $0
+              }
+            }
+          ' "${manifests_list}" >> "${keep_manifests}"
+
+          sort -u -o "${keep_manifests}" "${keep_manifests}"
+
+          : > "${keep_paths}"
+          while IFS= read -r manifest_name; do
+            gcloud storage cat "${manifest_prefix}/${manifest_name}" >> "${keep_paths}"
+            printf '\n' >> "${keep_paths}"
+          done < "${keep_manifests}"
+
+          # Never target deployment metadata for cleanup.
+          printf 'index.html\n' >> "${keep_paths}"
+          sort -u -o "${keep_paths}" "${keep_paths}"
+
+          gcloud storage ls --recursive "gs://${bucket}" \
+            | awk '{print $1}' \
+            | sed "s#gs://${bucket}/##" \
+            | grep -v '^_deploy/' \
+            | sort -u > "${all_objects}"
+
+          comm -23 "${all_objects}" "${keep_paths}" > "${delete_paths}"
+
+          if [ ! -s "${delete_paths}" ]; then
+            echo "No stale frontend objects to delete."
+            exit 0
+          fi
+
+          echo "Deleting stale frontend objects:"
+          cat "${delete_paths}"
+
+          sed "s#^#gs://${bucket}/#" "${delete_paths}" \
+            | gcloud storage rm --read-paths-from-stdin

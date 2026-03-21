@@ -1,0 +1,187 @@
+name: Frontend CD
+
+# Reusable workflow dedicated to static frontend deployment on Google Cloud.
+# It builds a Vite app, uploads the new build to a GCS bucket, applies
+# per-file cache headers, invalidates the HTML entrypoints on Cloud CDN,
+# and stores a deployment manifest for later cleanup jobs.
+
+on:
+  workflow_call:
+    inputs:
+      gcp_project_id:
+        type: string
+        required: true
+      workload_identity_provider:
+        type: string
+        required: true
+      deploy_service_account:
+        type: string
+        required: true
+      frontend_bucket:
+        type: string
+        required: true
+      frontend_url_map:
+        type: string
+        required: true
+      node_version:
+        type: string
+        required: false
+        default: "20"
+      workdir:
+        type: string
+        required: false
+        default: .
+      build_command:
+        type: string
+        required: false
+        default: npm run build
+      dist_dir:
+        type: string
+        required: false
+        default: dist
+      invalidation_paths:
+        type: string
+        required: false
+        default: "/,/index.html"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.deploy_service_account }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ inputs.gcp_project_id }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.workdir }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.workdir }}
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: ${{ inputs.workdir }}
+        run: ${{ inputs.build_command }}
+
+      - name: Validate build output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dist_path="${{ inputs.workdir }}/${{ inputs.dist_dir }}"
+
+          test -d "${dist_path}"
+          test -f "${dist_path}/index.html"
+
+      - name: Create deployment manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dist_path="${{ inputs.workdir }}/${{ inputs.dist_dir }}"
+          manifest_path="${RUNNER_TEMP}/deploy-manifest.txt"
+
+          (
+            cd "${dist_path}"
+            find . -type f | sed 's#^./##' | sort
+          ) > "${manifest_path}"
+
+          echo "DEPLOY_MANIFEST=${manifest_path}" >> "${GITHUB_ENV}"
+
+      - name: Upload hashed assets with long cache
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dist_path="${{ inputs.workdir }}/${{ inputs.dist_dir }}"
+
+          if [ -d "${dist_path}/assets" ]; then
+            gcloud storage rsync "${dist_path}/assets" "gs://${{ inputs.frontend_bucket }}/assets" \
+              --recursive \
+              --cache-control="public,max-age=31536000,immutable"
+          fi
+
+      - name: Upload non-index files with short cache
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dist_path="${{ inputs.workdir }}/${{ inputs.dist_dir }}"
+
+          while IFS= read -r -d '' file; do
+            rel_path="${file#${dist_path}/}"
+
+            gcloud storage cp "${file}" "gs://${{ inputs.frontend_bucket }}/${rel_path}" \
+              --cache-control="public,max-age=300,must-revalidate"
+          done < <(
+            find "${dist_path}" -type f \
+              ! -path "${dist_path}/assets/*" \
+              ! -name 'index.html' \
+              -print0
+          )
+
+      - name: Upload index.html last with 3 minute cache
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dist_path="${{ inputs.workdir }}/${{ inputs.dist_dir }}"
+
+          gcloud storage cp "${dist_path}/index.html" "gs://${{ inputs.frontend_bucket }}/index.html" \
+            --content-type="text/html; charset=utf-8" \
+            --cache-control="public,max-age=180,must-revalidate"
+
+      - name: Upload deployment manifest for later cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          manifest_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          manifest_object="gs://${{ inputs.frontend_bucket }}/_deploy/manifests/${manifest_timestamp}-${GITHUB_SHA}.txt"
+
+          gcloud storage cp "${DEPLOY_MANIFEST}" "${manifest_object}" \
+            --cache-control="no-store"
+
+      - name: Invalidate cached HTML entrypoints
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IFS=',' read -r -a invalidation_paths <<< "${{ inputs.invalidation_paths }}"
+
+          for raw_path in "${invalidation_paths[@]}"; do
+            path="$(echo "${raw_path}" | xargs)"
+            [ -z "${path}" ] && continue
+
+            cmd=(
+              gcloud compute url-maps invalidate-cdn-cache "${{ inputs.frontend_url_map }}"
+              --project "${{ inputs.gcp_project_id }}"
+              --path "${path}"
+            )
+
+            "${cmd[@]}"
+          done
+
+      - name: Output deployment target
+        run: |
+          echo "Bucket: gs://${{ inputs.frontend_bucket }}"
+          echo "URL map: ${{ inputs.frontend_url_map }}"
