@@ -35,6 +35,10 @@ on:
         type: string
         required: false
         default: npm run build
+      build_env_vars:
+        type: string
+        required: false
+        default: ""
       dist_dir:
         type: string
         required: false
@@ -77,6 +81,16 @@ jobs:
       - name: Install dependencies
         working-directory: ${{ inputs.workdir }}
         run: npm ci
+
+      - name: Write production build env
+        if: ${{ inputs.build_env_vars != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > "${{ inputs.workdir }}/.env.production" <<'EOF'
+          ${{ inputs.build_env_vars }}
+          EOF
 
       - name: Build frontend
         working-directory: ${{ inputs.workdir }}
