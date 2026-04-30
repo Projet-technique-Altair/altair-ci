@@ -197,6 +197,10 @@ jobs:
             env_vars_file="$(mktemp)"
 
             while IFS= read -r env_line; do
+              # GitHub variables pasted from Windows editors can keep CRLF endings.
+              # Strip the trailing CR before writing values to the Cloud Run env file.
+              env_line="${env_line%$'\r'}"
+
               # Skip empty lines to let repos format the variable more readably.
               [ -z "${env_line}" ] && continue
 
