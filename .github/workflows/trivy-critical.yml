@@ -1,24 +1,18 @@
-name: Trivy Critical Scan
+name: Trivy Image Scan
 
 on:
   workflow_call:
     inputs:
-      scan_type:
-        description: Trivy scan type. Use fs for repository scans or image for container images.
-        type: string
-        required: false
-        default: fs
-      scan_ref:
-        description: Path or repository reference to scan when scan_type is not image.
-        type: string
-        required: false
-        default: .
       image_ref:
-        description: Container image reference to scan when scan_type is image.
+        description: Container image reference to scan.
+        type: string
+        required: true
+      report_severity:
+        description: Severities reported to GitHub Security through SARIF.
         type: string
         required: false
-        default: ""
-      severity:
+        default: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+      block_severity:
         description: Comma-separated severities that should fail the job.
         type: string
         required: false
@@ -32,45 +26,41 @@ on:
         description: Ignore vulnerabilities that do not have a fixed version yet.
         type: boolean
         required: false
-        default: true
+        default: false
 
 permissions:
   contents: read
+  security-events: write
 
 jobs:
   trivy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Validate image scan input
-        if: inputs.scan_type == 'image' && inputs.image_ref == ''
-        run: |
-          echo "::error::image_ref is required when scan_type is image"
-          exit 1
-
-      - name: Trivy repository scan
-        if: inputs.scan_type != 'image'
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          scan-type: ${{ inputs.scan_type }}
-          scan-ref: ${{ inputs.scan_ref }}
-          scanners: ${{ inputs.scanners }}
-          severity: ${{ inputs.severity }}
-          ignore-unfixed: ${{ inputs.ignore_unfixed }}
-          exit-code: "1"
-          format: table
-
-      - name: Trivy image scan
-        if: inputs.scan_type == 'image'
+      - name: Trivy image report for GitHub Security
         uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: image
           image-ref: ${{ inputs.image_ref }}
           scanners: ${{ inputs.scanners }}
-          severity: ${{ inputs.severity }}
+          severity: ${{ inputs.report_severity }}
           ignore-unfixed: ${{ inputs.ignore_unfixed }}
-          exit-code: "1"
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: "0"
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Trivy critical gate
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ inputs.image_ref }}
+          scanners: ${{ inputs.scanners }}
+          severity: ${{ inputs.block_severity }}
+          ignore-unfixed: ${{ inputs.ignore_unfixed }}
           format: table
+          exit-code: "1"

@@ -7,13 +7,44 @@ on:
         type: string
         required: false
         default: stable
+      trivy_image_scan:
+        type: boolean
+        required: false
+        default: true
+      trivy_dockerfile:
+        type: string
+        required: false
+        default: Dockerfile
+      trivy_context:
+        type: string
+        required: false
+        default: .
+      trivy_platform:
+        type: string
+        required: false
+        default: linux/amd64
+      trivy_report_severity:
+        type: string
+        required: false
+        default: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+      trivy_block_severity:
+        type: string
+        required: false
+        default: CRITICAL
+      trivy_ignore_unfixed:
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
+  security-events: write
 
 jobs:
   ci:
     runs-on: ubuntu-latest
+    env:
+      TRIVY_IMAGE_REF: altair-ci-trivy:${{ github.sha }}
 
     services:
       postgres:
@@ -66,3 +97,43 @@ jobs:
       - name: Clippy (non-blocking)
         run: |
           cargo clippy --all-targets --locked -- -D warnings || echo "::warning::clippy warnings detected"
+
+      - name: Build Docker image for Trivy
+        if: inputs.trivy_image_scan
+        run: |
+          docker build \
+            --platform "${{ inputs.trivy_platform }}" \
+            -f "${{ inputs.trivy_dockerfile }}" \
+            -t "${TRIVY_IMAGE_REF}" \
+            "${{ inputs.trivy_context }}"
+
+      - name: Trivy image report for GitHub Security
+        if: inputs.trivy_image_scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.TRIVY_IMAGE_REF }}
+          scanners: vuln
+          severity: ${{ inputs.trivy_report_severity }}
+          ignore-unfixed: ${{ inputs.trivy_ignore_unfixed }}
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: "0"
+
+      - name: Upload Trivy SARIF
+        if: inputs.trivy_image_scan
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Trivy critical gate
+        if: inputs.trivy_image_scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.TRIVY_IMAGE_REF }}
+          scanners: vuln
+          severity: ${{ inputs.trivy_block_severity }}
+          ignore-unfixed: ${{ inputs.trivy_ignore_unfixed }}
+          format: table
+          exit-code: "1"
