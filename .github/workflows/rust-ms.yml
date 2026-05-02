@@ -35,6 +35,10 @@ on:
         type: boolean
         required: false
         default: false
+      trivy_gate_ignore_unfixed:
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -113,6 +117,6 @@ jobs:
           image-ref: ${{ env.TRIVY_IMAGE_REF }}
           scanners: vuln
           severity: ${{ inputs.trivy_block_severity }}
-          ignore-unfixed: ${{ inputs.trivy_ignore_unfixed }}
+          ignore-unfixed: ${{ inputs.trivy_gate_ignore_unfixed }}
           format: table
           exit-code: "1"
