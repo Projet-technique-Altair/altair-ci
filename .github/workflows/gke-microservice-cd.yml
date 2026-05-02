@@ -36,18 +36,10 @@ on:
       k8s_container_name:
         type: string
         required: true
-      workdir:
+      image_tag:
         type: string
         required: false
-        default: .
-      dockerfile:
-        type: string
-        required: false
-        default: Dockerfile
-      platform:
-        type: string
-        required: false
-        default: linux/amd64
+        default: ""
       manifest_path:
         type: string
         required: false
@@ -76,16 +68,41 @@ jobs:
         with:
           project_id: ${{ inputs.gcp_project_id }}
 
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker "${{ inputs.artifact_registry_host }}" --quiet
-
-      - name: Compute next image version
+      - name: Resolve deployment image and next version
         id: version
         shell: bash
         run: |
           set -euo pipefail
 
           image_base="${{ inputs.artifact_registry_host }}/${{ inputs.gcp_project_id }}/${{ inputs.artifact_registry_repo }}/${{ inputs.image_name }}"
+          source_tag=""
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            source_tag="${{ inputs.image_tag }}"
+            if [ -z "${source_tag}" ]; then
+              echo "::error::workflow_dispatch requires inputs.image_tag"
+              exit 1
+            fi
+          else
+            source_tag="${{ github.event.workflow_run.head_sha }}"
+            if [ -z "${source_tag}" ]; then
+              echo "::error::workflow_run.head_sha is empty"
+              exit 1
+            fi
+          fi
+
+          source_image_uri="${image_base}:${source_tag}"
+
+          source_image_exists="$(
+            gcloud artifacts docker tags list "${image_base}" \
+              --format='value(tag)' 2>/dev/null \
+            | grep -Fx "${source_tag}" || true
+          )"
+
+          if [ -z "${source_image_exists}" ]; then
+            echo "::error::Source image tag ${source_tag} does not exist in Artifact Registry for ${image_base}"
+            exit 1
+          fi
 
           latest_version="$(
             gcloud artifacts docker tags list "${image_base}" \
@@ -105,24 +122,13 @@ jobs:
           versioned_image_uri="${image_base}:${next_version}"
           latest_image_uri="${image_base}:latest"
 
+          echo "SOURCE_TAG=${source_tag}" >> "${GITHUB_ENV}"
+          echo "SOURCE_IMAGE_URI=${source_image_uri}" >> "${GITHUB_ENV}"
           echo "VERSIONED_IMAGE_URI=${versioned_image_uri}" >> "${GITHUB_ENV}"
           echo "LATEST_IMAGE_URI=${latest_image_uri}" >> "${GITHUB_ENV}"
 
-      - name: Build image
-        working-directory: ${{ inputs.workdir }}
-        run: |
-          docker build \
-            --platform "${{ inputs.platform }}" \
-            -f "${{ inputs.dockerfile }}" \
-            -t "${VERSIONED_IMAGE_URI}" \
-            -t "${LATEST_IMAGE_URI}" \
-            .
-
-      - name: Push versioned image
-        run: docker push "${VERSIONED_IMAGE_URI}"
-
-      - name: Push latest image
-        run: docker push "${LATEST_IMAGE_URI}"
+      - name: Tag source image with deployment version
+        run: gcloud artifacts docker tags add "${SOURCE_IMAGE_URI}" "${VERSIONED_IMAGE_URI}"
 
       - name: Get GKE credentials
         uses: google-github-actions/get-gke-credentials@v2
@@ -145,7 +151,12 @@ jobs:
           kubectl -n "${{ inputs.k8s_namespace }}" rollout status \
             deployment/"${{ inputs.k8s_deployment_name }}"
 
+      - name: Update latest tag after successful rollout
+        if: env.SOURCE_TAG != 'latest'
+        run: gcloud artifacts docker tags add "${SOURCE_IMAGE_URI}" "${LATEST_IMAGE_URI}"
+
       - name: Output deployed image
         run: |
+          echo "Source image: ${SOURCE_IMAGE_URI}"
           echo "Deployed image: ${VERSIONED_IMAGE_URI}"
           echo "Convenience tag: ${LATEST_IMAGE_URI}"

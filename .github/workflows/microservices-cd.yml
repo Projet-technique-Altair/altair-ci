@@ -33,18 +33,10 @@ on:
       image_name:
         type: string
         required: true
-      workdir:
+      image_tag:
         type: string
         required: false
-        default: .
-      dockerfile:
-        type: string
-        required: false
-        default: Dockerfile
-      platform:
-        type: string
-        required: false
-        default: linux/amd64
+        default: ""
       cloud_run_service_account:
         type: string
         required: false
@@ -63,7 +55,7 @@ on:
         default: ""
 
 permissions:
-  # Required by actions/checkout.
+  # Kept read-only for repository metadata access if needed later.
   contents: read
   # Required by google-github-actions/auth for Workload Identity Federation.
   id-token: write
@@ -73,9 +65,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Authenticate to Google Cloud
         # Uses the GitHub OIDC token + the configured workload identity provider
         # to impersonate the deploy service account without storing a static GCP key.
@@ -90,21 +79,42 @@ jobs:
         with:
           project_id: ${{ inputs.gcp_project_id }}
 
-      - name: Configure Docker for Artifact Registry
-        # Lets Docker push to the Artifact Registry host passed by the caller.
-        run: gcloud auth configure-docker "${{ inputs.artifact_registry_host }}" --quiet
-
-      - name: Compute next image version
+      - name: Resolve deployment image and next version
         id: version
         shell: bash
         run: |
           set -euo pipefail
 
-          # Base image path without the tag.
           image_base="${{ inputs.artifact_registry_host }}/${{ inputs.gcp_project_id }}/${{ inputs.artifact_registry_repo }}/${{ inputs.image_name }}"
+          source_tag=""
 
-          # Ask Artifact Registry for existing tags of the current image.
-          # Only keep tags of the form vN, then pick the highest numeric suffix.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            source_tag="${{ inputs.image_tag }}"
+            if [ -z "${source_tag}" ]; then
+              echo "::error::workflow_dispatch requires inputs.image_tag"
+              exit 1
+            fi
+          else
+            source_tag="${{ github.event.workflow_run.head_sha }}"
+            if [ -z "${source_tag}" ]; then
+              echo "::error::workflow_run.head_sha is empty"
+              exit 1
+            fi
+          fi
+
+          source_image_uri="${image_base}:${source_tag}"
+
+          source_image_exists="$(
+            gcloud artifacts docker tags list "${image_base}" \
+              --format='value(tag)' 2>/dev/null \
+            | grep -Fx "${source_tag}" || true
+          )"
+
+          if [ -z "${source_image_exists}" ]; then
+            echo "::error::Source image tag ${source_tag} does not exist in Artifact Registry for ${image_base}"
+            exit 1
+          fi
+
           latest_version="$(
             gcloud artifacts docker tags list "${image_base}" \
               --format='value(tag)' 2>/dev/null \
@@ -124,33 +134,21 @@ jobs:
           latest_image_uri="${image_base}:latest"
 
           echo "IMAGE_BASE=${image_base}" >> "${GITHUB_ENV}"
+          echo "SOURCE_TAG=${source_tag}" >> "${GITHUB_ENV}"
+          echo "SOURCE_IMAGE_URI=${source_image_uri}" >> "${GITHUB_ENV}"
           echo "VERSION_TAG=${next_version}" >> "${GITHUB_ENV}"
           echo "VERSIONED_IMAGE_URI=${versioned_image_uri}" >> "${GITHUB_ENV}"
           echo "LATEST_IMAGE_URI=${latest_image_uri}" >> "${GITHUB_ENV}"
 
+          echo "source_tag=${source_tag}" >> "${GITHUB_OUTPUT}"
+          echo "source_image_uri=${source_image_uri}" >> "${GITHUB_OUTPUT}"
           echo "version_tag=${next_version}" >> "${GITHUB_OUTPUT}"
           echo "versioned_image_uri=${versioned_image_uri}" >> "${GITHUB_OUTPUT}"
           echo "latest_image_uri=${latest_image_uri}" >> "${GITHUB_OUTPUT}"
 
-      - name: Build image
-        working-directory: ${{ inputs.workdir }}
-        run: |
-          # Build context comes from the caller repo.
-          # `workdir` lets a repo build from a subdirectory if needed.
-          docker build \
-            --platform "${{ inputs.platform }}" \
-            -f "${{ inputs.dockerfile }}" \
-            -t "${VERSIONED_IMAGE_URI}" \
-            -t "${LATEST_IMAGE_URI}" \
-            .
-
-      - name: Push versioned image
-        # Pushes the immutable deployment tag, for example v7.
-        run: docker push "${VERSIONED_IMAGE_URI}"
-
-      - name: Push latest image
-        # Pushes a convenience tag pointing to the most recently built image.
-        run: docker push "${LATEST_IMAGE_URI}"
+      - name: Tag source image with deployment version
+        # Adds the deployment tag, for example v7, to the image already pushed by CI.
+        run: gcloud artifacts docker tags add "${SOURCE_IMAGE_URI}" "${VERSIONED_IMAGE_URI}"
 
       - name: Deploy to Cloud Run
         shell: bash
@@ -235,7 +233,12 @@ jobs:
             rm -f "${env_vars_file}"
           fi
 
+      - name: Update latest tag after successful rollout
+        if: env.SOURCE_TAG != 'latest'
+        run: gcloud artifacts docker tags add "${SOURCE_IMAGE_URI}" "${LATEST_IMAGE_URI}"
+
       - name: Output deployed image
         run: |
+          echo "Source image: ${SOURCE_IMAGE_URI}"
           echo "Deployed image: ${VERSIONED_IMAGE_URI}"
           echo "Convenience tag: ${LATEST_IMAGE_URI}"
